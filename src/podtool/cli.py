@@ -11,11 +11,13 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from importlib.metadata import version
+from pathlib import Path
 from typing import Any
 
 from pypodlib import Playlist, Track
 
-from .database import Database, DatabaseError, load
+from .artists import plan_edits
+from .database import Database, DatabaseError, load, open_ipod
 
 _CHECKSUM_NAMES = {0: "none", 1: "HASH58", 2: "HASH72", 3: "HASHAB"}
 
@@ -300,6 +302,51 @@ def cmd_playlists(db: Database, args: argparse.Namespace) -> None:
     )
 
 
+def cmd_simplify_artists(args: argparse.Namespace) -> None:
+    ipod = None
+    if args.dry_run:
+        tracks = load(args.database).library.tracks
+    else:
+        # Imported late: pyPodLib's sync package logs warnings on import.
+        from pypodlib.sync._db_io import commit_playcounts_if_needed
+
+        ipod = open_ipod(args.database)
+        try:
+            # Saving folds pending play counts into the database, so let
+            # pyPodLib commit and clear them first rather than leave the
+            # Play Counts file behind to be counted twice.
+            commit_playcounts_if_needed(Path(ipod.path))
+            tracks = ipod.library(reload=True).tracks
+        except Exception as exc:
+            raise DatabaseError(f"could not read the iPod's database: {exc}") from exc
+
+    edits = plan_edits(tracks)
+    for edit in edits:
+        edit.apply()
+        if not args.json:
+            print(f"{edit.track.title or '(untitled)'}: {edit.label} {edit.old!r} -> {edit.new!r}", flush=True)
+
+    changed_tracks = len({id(e.track.data) for e in edits})
+    if args.json:
+        _print_json(
+            [
+                {"db_track_id": e.track.db_track_id, "title": e.track.title, "field": e.label, "old": e.old, "new": e.new}
+                for e in edits
+            ]
+        )
+    summary = f"{len(edits)} edits to {changed_tracks} of {len(tracks)} tracks"
+    if ipod is None:
+        print(f"Dry run: {summary}; nothing was written.", file=sys.stderr)
+    elif not edits:
+        print("Nothing to simplify; the database was left untouched.", file=sys.stderr)
+    else:
+        try:
+            ipod.save()
+        except Exception as exc:
+            raise DatabaseError(f"saving the database failed: {exc}") from exc
+        print(f"Saved {summary} to {ipod.path}.", file=sys.stderr)
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 
@@ -327,6 +374,17 @@ def _build_parser() -> argparse.ArgumentParser:
     playlists = commands.add_parser("playlists", parents=[common], help="list playlists")
     playlists.set_defaults(func=cmd_playlists)
 
+    simplify = commands.add_parser(
+        "simplify-artists",
+        parents=[common],
+        help="reduce 'A, B' artist credits to 'A' when A has tracks of its own",
+        description="Rewrite comma-separated artist and album artist credits to just their first "
+        "name, but only when another track in the library is credited to that name alone. "
+        "Saving requires a mounted iPod; --dry-run also works on a standalone iTunesDB file.",
+    )
+    simplify.add_argument("-n", "--dry-run", action="store_true", help="list the edits without saving them")
+    simplify.set_defaults(func=cmd_simplify_artists)
+
     return parser
 
 
@@ -334,8 +392,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.CRITICAL, format="%(name)s: %(message)s")
     try:
-        db = load(args.database)
-        args.func(db, args)
+        if args.func is cmd_simplify_artists:
+            args.func(args)
+        else:
+            args.func(load(args.database), args)
         sys.stdout.flush()
     except DatabaseError as exc:
         print(f"podtool: error: {exc}", file=sys.stderr)

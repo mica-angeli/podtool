@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pypodlib import Library
+import pypodlib
+from pypodlib import IPod, Library
 from pypodlib.itunesdb_parser import parse_itunesdb
 from pypodlib.itunesdb_parser.ipod_library import load_ipod_library
 
@@ -77,3 +78,21 @@ def load(path: str | Path) -> Database:
         artists=data.get("mhsd_type_8") or [],
         library=library,
     )
+
+
+def open_ipod(path: str | Path) -> IPod:
+    """Connect to the iPod that *path* (its mount point, or the database
+    file inside it) belongs to, for making changes."""
+    path = Path(path).expanduser()
+    if path.is_dir():
+        root = path
+    elif path.parent.name == _ITUNES_DIR.name and path.parent.parent.name == _ITUNES_DIR.parent.name:
+        root = path.parents[2]
+    else:
+        # pyPodLib signs the database for one device, so it only writes in place.
+        raise DatabaseError(f"{path} is not on an iPod; changes can only be saved to a mounted iPod")
+    resolve_path(root)
+    try:
+        return pypodlib.connect(root)
+    except ValueError as exc:
+        raise DatabaseError(f"could not identify the iPod at {root}: {exc}") from exc
