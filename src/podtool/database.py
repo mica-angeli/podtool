@@ -80,18 +80,27 @@ def load(path: str | Path) -> Database:
     )
 
 
-def open_ipod(path: str | Path) -> IPod:
-    """Connect to the iPod that *path* (its mount point, or the database
-    file inside it) belongs to, for making changes."""
+def ipod_root(path: str | Path) -> Path | None:
+    """Return the mount point of the iPod that *path* (the mount point, or
+    the database file inside it) belongs to, or None for a standalone file."""
     path = Path(path).expanduser()
     if path.is_dir():
         root = path
     elif path.parent.name == _ITUNES_DIR.name and path.parent.parent.name == _ITUNES_DIR.parent.name:
         root = path.parents[2]
     else:
+        return None
+    resolve_path(root)
+    return root
+
+
+def open_ipod(path: str | Path) -> IPod:
+    """Connect to the iPod that *path* (its mount point, or the database
+    file inside it) belongs to, for making changes."""
+    root = ipod_root(path)
+    if root is None:
         # pyPodLib signs the database for one device, so it only writes in place.
         raise DatabaseError(f"{path} is not on an iPod; changes can only be saved to a mounted iPod")
-    resolve_path(root)
     try:
         return pypodlib.connect(root)
     except ValueError as exc:

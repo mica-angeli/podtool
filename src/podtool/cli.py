@@ -9,15 +9,18 @@ import os
 import sys
 from collections import Counter
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
-from pypodlib import Playlist, Track
+from pypodlib import IPod, Playlist, Track
 
+from . import compress
 from .artists import plan_edits
-from .database import Database, DatabaseError, load, open_ipod
+from .compress import CompressError
+from .database import Database, DatabaseError, ipod_root, load, open_ipod
 
 _CHECKSUM_NAMES = {0: "none", 1: "HASH58", 2: "HASH72", 3: "HASHAB"}
 
@@ -302,23 +305,34 @@ def cmd_playlists(db: Database, args: argparse.Namespace) -> None:
     )
 
 
+def _editable_tracks(ipod: IPod) -> list[Track]:
+    # Imported late: pyPodLib's sync package logs warnings on import.
+    from pypodlib.sync._db_io import commit_playcounts_if_needed
+
+    try:
+        # Saving folds pending play counts into the database, so let
+        # pyPodLib commit and clear them first rather than leave the
+        # Play Counts file behind to be counted twice.
+        commit_playcounts_if_needed(Path(ipod.path))
+        return ipod.library(reload=True).tracks
+    except Exception as exc:
+        raise DatabaseError(f"could not read the iPod's database: {exc}") from exc
+
+
+def _save(ipod: IPod) -> None:
+    try:
+        ipod.save()
+    except Exception as exc:
+        raise DatabaseError(f"saving the database failed: {exc}") from exc
+
+
 def cmd_simplify_artists(args: argparse.Namespace) -> None:
     ipod = None
     if args.dry_run:
         tracks = load(args.database).library.tracks
     else:
-        # Imported late: pyPodLib's sync package logs warnings on import.
-        from pypodlib.sync._db_io import commit_playcounts_if_needed
-
         ipod = open_ipod(args.database)
-        try:
-            # Saving folds pending play counts into the database, so let
-            # pyPodLib commit and clear them first rather than leave the
-            # Play Counts file behind to be counted twice.
-            commit_playcounts_if_needed(Path(ipod.path))
-            tracks = ipod.library(reload=True).tracks
-        except Exception as exc:
-            raise DatabaseError(f"could not read the iPod's database: {exc}") from exc
+        tracks = _editable_tracks(ipod)
 
     edits = plan_edits(tracks)
     for edit in edits:
@@ -340,11 +354,123 @@ def cmd_simplify_artists(args: argparse.Namespace) -> None:
     elif not edits:
         print("Nothing to simplify; the database was left untouched.", file=sys.stderr)
     else:
-        try:
-            ipod.save()
-        except Exception as exc:
-            raise DatabaseError(f"saving the database failed: {exc}") from exc
+        _save(ipod)
         print(f"Saved {summary} to {ipod.path}.", file=sys.stderr)
+
+
+def _check_saveable(ipod: IPod, tracks: Sequence[Track]) -> None:
+    """Run, on the database as it stands, the checks that pyPodLib fails a
+    save for, such as a track whose file is missing."""
+    # Imported late: pyPodLib's sync package logs warnings on import.
+    from pypodlib.sync._db_io import verify_written_database
+
+    try:
+        verify_written_database(Path(ipod.path), expected_track_count=len(tracks))
+    except Exception as exc:
+        raise DatabaseError(f"pyPodLib would not save this iPod's database, so nothing was compressed: {exc}") from exc
+
+
+def _track_label(track: Track) -> str:
+    return f"{track.artist or '(no artist)'} - {track.title or '(untitled)'}"
+
+
+def _find_lossless(root: Path, tracks: Sequence[Track]) -> list[tuple[Track, Path, int]]:
+    """Return each lossless track with its file and the file's size.
+
+    Every file is opened to check, which takes a while on an iPod's disk.
+    """
+    tty = sys.stderr.isatty()
+    newline = "\n" if tty else ""
+    found = []
+    for index, track in enumerate(tracks, 1):
+        if tty:
+            print(f"\rChecking files: {index}/{len(tracks)}", end="", file=sys.stderr, flush=True)
+        try:
+            path = compress.lossless_file(root, track)
+            if path is not None:
+                found.append((track, path, path.stat().st_size))
+        except (CompressError, OSError) as exc:
+            print(f"{newline}podtool: skipping {_track_label(track)}: {exc}", file=sys.stderr)
+    if tty:
+        print(file=sys.stderr)
+    return found
+
+
+def cmd_compress(args: argparse.Namespace) -> None:
+    root = ipod_root(args.database)
+    if root is None:
+        raise DatabaseError(f"{args.database} is not on an iPod; compress works on the music files beside the database")
+    tracks = load(root).library.tracks
+    lossless = _find_lossless(root, tracks)
+
+    if args.dry_run:
+        if args.json:
+            _print_json([{**_track_summary(t), "file": str(path), "file_size": size} for t, path, size in lossless])
+        elif lossless:
+            rows = [
+                [_clip(t.title, 40), _clip(t.artist, 28), _clip(t.album, 32), _duration(t.length), _size(size)]
+                for t, _, size in lossless
+            ]
+            _table(["Title", "Artist", "Album", "Time", "Size"], rows, right=(3, 4))
+        total = sum(size for _, _, size in lossless)
+        estimate = sum(t.length for t, _, _ in lossless) * compress.BITRATE_KBPS // 8
+        print(
+            f"Dry run: {len(lossless)} of {len(tracks)} tracks are lossless, {_size(total)} that would "
+            f"compress to about {_size(estimate)}; nothing was written.",
+            file=sys.stderr,
+        )
+        return
+
+    encoder = compress.find_encoder()
+    # Before any file is replaced, so that an iPod whose database could not
+    # be updated afterwards is left alone.
+    ipod = open_ipod(args.database)
+    _check_saveable(ipod, tracks)
+
+    results = []
+    failed = 0
+    pool = ThreadPoolExecutor(max(1, args.jobs))
+    encodes = {pool.submit(compress.encode, path, encoder): (track, size) for track, path, size in lossless}
+    try:
+        for encode in as_completed(encodes):
+            track, size = encodes.pop(encode)
+            label = f"[{len(results) + failed + 1}/{len(lossless)}] {_track_label(track)}"
+            try:
+                encoded = encode.result()
+            except CompressError as exc:
+                failed += 1
+                print(f"podtool: {label}: not compressed: {exc}", file=sys.stderr)
+                continue
+            compress.replace(root, track, encoded)
+            new_size = encoded.fields["size"]
+            results.append({"db_track_id": track.db_track_id, "title": track.title, "artist": track.artist, "old_size": size, "new_size": new_size})
+            if not args.json:
+                print(f"{label}: {_size(size)} -> {_size(new_size)}", flush=True)
+    finally:
+        # Also reached when interrupted: stop encoding, then record what was done.
+        pool.shutdown(cancel_futures=True)
+        for encode in encodes:
+            if not encode.cancelled() and encode.exception() is None:
+                compress.discard(encode.result().path)
+        updated = 0
+        if compress.has_journal(root):
+            # Reread the database rather than save the copy read before hours
+            # of encoding.  The journal may also hold what an earlier run was
+            # stopped before it could save.
+            updated = compress.apply_journal(root, _editable_tracks(ipod))
+            if updated:
+                _save(ipod)
+            compress.clear_journal(root)
+        if args.json:
+            _print_json(results)
+        freed = sum(r["old_size"] - r["new_size"] for r in results)
+        print(
+            f"Compressed {len(results)} of {len(lossless)} lossless tracks, freeing {_size(freed)}; "
+            + (f"updated {updated} tracks in the database on {ipod.path}." if updated else "the database was left untouched."),
+            file=sys.stderr,
+        )
+    if failed:
+        raise CompressError(f"{failed} of the lossless tracks could not be compressed")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -385,6 +511,19 @@ def _build_parser() -> argparse.ArgumentParser:
     simplify.add_argument("-n", "--dry-run", action="store_true", help="list the edits without saving them")
     simplify.set_defaults(func=cmd_simplify_artists)
 
+    compress_parser = commands.add_parser(
+        "compress",
+        parents=[common],
+        help=f"re-encode lossless tracks as {compress.BITRATE_KBPS} kbps AAC",
+        description=f"Replace every Apple Lossless file on a mounted iPod with a {compress.BITRATE_KBPS} kbps AAC "
+        "encoding of it that carries the same tags.  In the database only each track's size, bit "
+        "rate and gapless playback numbers change.  Needs ffmpeg.  The lossless originals are "
+        "not kept, and a run that is interrupted can be resumed by running it again.",
+    )
+    compress_parser.add_argument("-n", "--dry-run", action="store_true", help="list the lossless tracks without compressing them")
+    compress_parser.add_argument("-j", "--jobs", type=int, default=min(4, os.cpu_count() or 1), metavar="N", help="encode N tracks at a time (default: %(default)s)")
+    compress_parser.set_defaults(func=cmd_compress)
+
     return parser
 
 
@@ -392,14 +531,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.CRITICAL, format="%(name)s: %(message)s")
     try:
-        if args.func is cmd_simplify_artists:
+        if args.func in (cmd_simplify_artists, cmd_compress):
             args.func(args)
         else:
             args.func(load(args.database), args)
         sys.stdout.flush()
-    except DatabaseError as exc:
+    except (DatabaseError, CompressError) as exc:
         print(f"podtool: error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
     except BrokenPipeError:
         # Output was piped into something like `head` that stopped reading.
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())

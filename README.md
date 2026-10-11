@@ -50,3 +50,37 @@ Each edit is printed as it is made. Saving rewrites the whole database through
 pyPodLib, which signs it for the device, so it needs a mounted iPod; the
 previous database is kept beside it as `iTunesDB.backup`. `--dry-run` also
 works on a standalone `iTunesDB` file.
+
+## Compressing lossless tracks
+
+```console
+uv run podtool compress /Volumes/IPOD --dry-run   # list the lossless tracks only
+uv run podtool compress /Volumes/IPOD             # re-encode them in place
+```
+
+Every track whose file holds Apple Lossless audio is re-encoded as 320 kbps
+AAC, and the new file takes the old one's place under the same name. The
+lossless originals are not kept. Tracks are found by reading the files, because
+the database of an iPod filled through libgpod calls every `.m4a` an "AAC audio
+file". This needs `ffmpeg` on the `PATH`; Apple's encoder is used where ffmpeg
+has it, as it does on macOS.
+
+The tags are not parsed and rewritten but copied byte for byte from the old
+file, so all of them survive, artwork and atoms that no tagger knows included.
+The one exception is iTunes' gapless tag, `iTunSMPB`, whose numbers are
+corrected when it is present because they describe the encoding.
+
+In the database, only the numbers that describe the file change: each
+compressed track's size, bit rate, sample rate (audio above 48 kHz is resampled
+to 48 kHz) and the encoder delay, padding and sample count that gapless
+playback uses. Titles, artists, ratings, play counts and playlists stay as
+they are. The database is saved the same way as by `simplify-artists`.
+
+Each new file is checked before it replaces the original: it must carry the
+same tags, be the same length and decode without error. A track that fails is
+reported and left alone. WAV and AIFF tracks are reported and left alone too.
+
+The run can be interrupted with Ctrl-C and started again later; the tracks
+already compressed are saved to the database first. If it is cut off harder
+than that, they are in a journal on the iPod, which the next run saves.
+`-j N` sets how many tracks are encoded at a time (4 by default).

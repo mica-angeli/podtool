@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "mutagen>=1.48.1",
     "pypodlib>=0.1.0",
 ]
 
